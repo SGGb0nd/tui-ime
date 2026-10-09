@@ -17,6 +17,13 @@ Typing `shurufaceshi` shows an underlined preedit plus a single-line candidate
 strip (`1.輸入法測試 2.輸入法 3.輸入`); `你好！` on the left was already committed
 straight into the shell prompt.
 
+## This fork: Codex Vim integration
+
+This fork adds a tmux IME status indicator and suspends Chinese interception
+when Codex's visible Vim footer says Normal, restoring your choice in Insert
+or Replace. For the Bash/daemon/tmux setup and Codex Vim defaults, see
+[setup/README.md](setup/README.md).
+
 ## Architecture
 
 ```
