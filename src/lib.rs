@@ -10,6 +10,7 @@ pub mod keymap;
 pub mod protocol;
 pub mod proxy;
 pub mod render;
+mod vim_mode;
 
 /// 防嵌套环境标记：proxy 给子进程注入（见 proxy::run），
 /// 在 tui-ime 内再次启动时据此拒绝——多层嵌套会让最外层旧实例

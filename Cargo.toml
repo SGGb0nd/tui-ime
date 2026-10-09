@@ -29,6 +29,7 @@ rime-api = "0.12.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+vt100 = "0.16.2"
 
 [dev-dependencies]
 tempfile = "3"

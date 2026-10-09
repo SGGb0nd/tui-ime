@@ -11,6 +11,8 @@
 use std::fs::File;
 use std::io::{Read, Stdout, Write};
 use std::os::unix::io::{AsFd, AsRawFd};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -33,6 +35,7 @@ use crate::keyevent::{to_legacy, InputEvent, Parser};
 use crate::keymap::{byte_to_rime, key_to_rime, XK_ESCAPE};
 use crate::protocol::{ContextSnapshot, ProxyRequest, ProxyResponse};
 use crate::render::{Renderer, Strip};
+use crate::vim_mode::{self, VimModeReader};
 
 /// 当前终端尺寸，读取失败或终端上报 0x0（裸 PTY 默认值）时退回 80x24
 fn term_size() -> PtySize {
@@ -111,6 +114,8 @@ impl Drop for ExtendedKeysGuard {
 struct InputFilter {
     parser: Parser,
     ime_on: bool,
+    ime_requested: bool,
+    vim_mode: Arc<AtomicU8>,
     /// daemon IPC client（连接失败时为 None → 纯透传降级）
     client: Option<IpcClient>,
     /// daemon session id（create_session 成功后填入）
@@ -126,9 +131,11 @@ struct InputFilter {
     renderer: Renderer,
     dsr_pending: bool,
     composing: bool,
+    tmux_pane: Option<String>,
+    displayed_mode: Option<&'static str>,
 }
 impl InputFilter {
-    fn new(log: Option<File>, stdout: Arc<Mutex<Stdout>>) -> Self {
+    fn new(log: Option<File>, stdout: Arc<Mutex<Stdout>>, vim_mode: Arc<AtomicU8>) -> Self {
         let socket_path = daemon::default_socket_path();
         let mut client = IpcClient::connect(&socket_path).ok();
 
@@ -152,9 +159,11 @@ impl InputFilter {
             let cfg = crate::config::Config::default();
             crate::config::toggle_key(&cfg.proxy)
         };
-        Self {
+        let mut filter = Self {
             parser: Parser::new(),
             ime_on: false,
+            ime_requested: false,
+            vim_mode,
             client,
             session_id,
             last_context: None,
@@ -165,6 +174,63 @@ impl InputFilter {
             renderer: Renderer::new(),
             dsr_pending: false,
             composing: false,
+            tmux_pane: std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()),
+            displayed_mode: None,
+        };
+        filter.update_mode_indicator();
+        filter
+    }
+
+    fn sync_vim_mode(&mut self) -> Result<()> {
+        let normal = self.vim_mode.load(Ordering::Acquire) == vim_mode::NORMAL;
+        let enabled = self.ime_requested && !normal;
+        if self.ime_on == enabled {
+            return Ok(());
+        }
+        self.ime_on = enabled;
+        if !enabled {
+            if let (Some(sid), Some(ref mut client)) = (self.session_id, &mut self.client) {
+                let _response: Result<ProxyResponse, _> =
+                    client.request(&ProxyRequest::ProcessKey {
+                        session_id: sid,
+                        keycode: XK_ESCAPE,
+                        modifiers: 0,
+                    });
+            }
+            self.last_context = None;
+            self.clear_ui()?;
+            self.dsr_pending = false;
+        }
+        self.log_line(&format!(
+            "ime: {} (vim_normal={normal})",
+            if enabled { "on" } else { "off" }
+        ));
+        self.update_mode_indicator();
+        Ok(())
+    }
+
+    fn update_mode_indicator(&mut self) {
+        let mode = if self.session_id.is_none() {
+            "OFF"
+        } else if self.ime_on {
+            "中文"
+        } else {
+            "EN"
+        };
+        if self.displayed_mode == Some(mode) {
+            return;
+        }
+        let Some(pane) = &self.tmux_pane else {
+            return;
+        };
+        let updated = Command::new("tmux")
+            .args(["set-option", "-p", "-t", pane, "@tui_ime_mode", mode])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if updated {
+            self.displayed_mode = Some(mode);
         }
     }
 
@@ -345,29 +411,18 @@ impl InputFilter {
             }
             InputEvent::Key(k) => {
                 if self.is_toggle_key(&k) {
-                    if self.ime_on {
-                        self.ime_on = false;
-                        // 取消残留组合（计划 D7）：经 daemon 发送 Esc
-                        if let (Some(sid), Some(ref mut client)) =
-                            (self.session_id, &mut self.client)
-                        {
-                            let _resp: Result<ProxyResponse, _> =
-                                client.request(&ProxyRequest::ProcessKey {
-                                    session_id: sid,
-                                    keycode: XK_ESCAPE,
-                                    modifiers: 0,
-                                });
-                        }
-                        self.last_context = None;
-                        self.clear_ui()?;
-                        self.dsr_pending = false;
-                        self.log_line("toggle: ime off");
-                    } else if self.client.is_some() {
-                        self.ime_on = true;
-                        self.log_line("toggle: ime on");
+                    if self.session_id.is_some() {
+                        self.ime_requested = !self.ime_requested;
+                        self.sync_vim_mode()?;
+                        self.log_line(if self.ime_requested {
+                            "toggle: ime requested"
+                        } else {
+                            "toggle: ime disabled"
+                        });
                     } else {
                         self.log_line("toggle: ignored (daemon unavailable)");
                     }
+                    self.update_mode_indicator();
                 } else if self.ime_on {
                     match key_to_rime(&k) {
                         Some((kc, mask)) => {
@@ -505,22 +560,27 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
 
     // 输入线程：stdin → IME 过滤器 → PTY master。
     // 解析器有未完成序列时用 30ms poll 超时判定裸 Esc（否则裸 Esc 会被
-    // 当成转义序列前缀无限攒住，需按两遍才生效）；无未完成序列则无限阻塞。
+    // 当成转义序列前缀无限攒住，需按两遍才生效）；空闲时每 50ms 同步 Vim 模式。
     let input_stdout = Arc::clone(&stdout);
+    let vim_mode = Arc::new(AtomicU8::new(vim_mode::UNKNOWN));
+    let input_vim_mode = Arc::clone(&vim_mode);
     thread::spawn(move || -> Result<()> {
         let stdin = std::io::stdin();
-        let mut filter = InputFilter::new(log, input_stdout);
+        let mut filter = InputFilter::new(log, input_stdout, input_vim_mode);
         let mut buf = [0u8; 16384];
         loop {
+            filter.sync_vim_mode()?;
             let timeout = if filter.parser_has_pending() {
                 PollTimeout::from(ESC_FLUSH_MS)
             } else {
-                PollTimeout::NONE
+                PollTimeout::from(50u16)
             };
             let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
             let nready = poll(&mut fds, timeout).context("poll stdin")?;
             if nready == 0 {
-                filter.process_pending(&mut *writer)?;
+                if filter.parser_has_pending() {
+                    filter.process_pending(&mut *writer)?;
+                }
                 continue;
             }
             let n = read(stdin.as_raw_fd(), &mut buf).context("read stdin")?;
@@ -528,6 +588,7 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
                 // 终端侧 EOF：进程随 SIGHUP 退出，此处不做额外清理
                 return Ok(());
             }
+            filter.sync_vim_mode()?;
             filter.process(&buf[..n], &mut *writer)?;
         }
     });
@@ -539,6 +600,8 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
     // tmux 只能观察到 proxy 进程：随子进程输出限流镜像内部前台进程身份
     // （cwd 到自身、窗口名经 tmux rename-window），见 src/identity.rs
     let mut mirror = child_pid.map(IdentityMirror::new);
+    let size = term_size();
+    let mut vim_reader = VimModeReader::new(size.rows, size.cols);
     let mut buf = [0u8; 16384];
     loop {
         match reader.read(&mut buf) {
@@ -546,6 +609,15 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
             Ok(n) => {
                 if let Some(mirror) = &mut mirror {
                     mirror.maybe_sync();
+                }
+                let size = term_size();
+                let codex_foreground = mirror
+                    .as_ref()
+                    .is_some_and(IdentityMirror::foreground_is_codex);
+                if let Some(mode) =
+                    vim_reader.process(&buf[..n], size.rows, size.cols, codex_foreground)
+                {
+                    vim_mode.store(mode, Ordering::Release);
                 }
                 let repush = snoop.scan(&buf[..n]);
                 let mut out = stdout.lock().expect("stdout mutex");
@@ -566,6 +638,13 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
     }
 
     let status = child.wait().context("wait child")?;
+    if let Ok(pane) = std::env::var("TMUX_PANE") {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-pu", "-t", &pane, "@tui_ime_mode"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 
     Ok(status.exit_code() as i32)
 }

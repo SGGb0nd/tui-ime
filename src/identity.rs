@@ -59,6 +59,12 @@ impl IdentityMirror {
         self.sync();
     }
 
+    pub(crate) fn foreground_is_codex(&self) -> bool {
+        self.foreground_pgrp()
+            .and_then(|pid| fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+            .is_some_and(|name| name.trim() == "codex")
+    }
+
     /// 同步内部 PTY 前台进程的 cwd 与窗口名。
     /// 前台进程随时可能退出（读 stat 与读 comm/cwd 之间存在竞态），
     /// 所有失败静默忽略、保留上次有效值，下一轮检查自愈。
