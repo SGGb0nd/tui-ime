@@ -65,6 +65,12 @@ impl IdentityMirror {
             .is_some_and(|name| name.trim() == "codex")
     }
 
+    pub(crate) fn foreground_is_tmux(&self) -> bool {
+        self.foreground_pgrp()
+            .and_then(|pid| fs::read_to_string(format!("/proc/{pid}/comm")).ok())
+            .is_some_and(|name| name.trim() == "tmux" || name.trim() == "tmux: client")
+    }
+
     /// 同步内部 PTY 前台进程的 cwd 与窗口名。
     /// 前台进程随时可能退出（读 stat 与读 comm/cwd 之间存在竞态），
     /// 所有失败静默忽略、保留上次有效值，下一轮检查自愈。

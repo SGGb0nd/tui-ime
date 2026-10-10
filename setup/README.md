@@ -89,9 +89,15 @@ interception is off (including Vim Normal); `中文` means it is on; `OFF` means
 the daemon session is unavailable. The indicator describes proxy interception,
 not Rime's internal ASCII switch.
 
-`Ctrl+J` commits the highlighted candidate when composing Chinese, then passes
-the newline shortcut to the application. In Codex Insert mode this starts a
-new line; ordinary Enter keeps its existing behavior.
+`Ctrl+Shift+j` commits the highlighted candidate when composing Chinese, then
+passes the newline shortcut to the application. In Codex Insert mode this
+starts a new line. Unshifted `Ctrl+j` keeps your existing tmux pane-navigation
+binding. The proxy preserves modifiers while a tmux client is foreground, so
+the outer shell wrapper does not collapse these two shortcuts into one.
+
+An old proxy around the SSH shell remains in memory after upgrading. Reconnect
+SSH and reattach the existing tmux session to reload that outer wrapper; tmux
+and its programs keep running. New panes load the updated inner wrapper.
 
 Vim detection was exercised with Codex 0.161.0 in both default and
 `--no-alt-screen` layouts, including resizing and returning to Bash. It reads

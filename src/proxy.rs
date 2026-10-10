@@ -31,7 +31,7 @@ const ESC_FLUSH_MS: u16 = 30;
 use crate::daemon;
 use crate::identity::IdentityMirror;
 use crate::ipc::IpcClient;
-use crate::keyevent::{to_legacy, EventType, InputEvent, Parser, CTRL};
+use crate::keyevent::{to_legacy, EventType, InputEvent, Parser, CTRL, SHIFT};
 use crate::keymap::{byte_to_rime, key_to_rime, XK_ESCAPE};
 use crate::protocol::{ContextSnapshot, ProxyRequest, ProxyResponse};
 use crate::render::{Renderer, Strip};
@@ -438,7 +438,9 @@ impl InputFilter {
                         self.log_line("toggle: ignored (daemon unavailable)");
                     }
                     self.update_mode_indicator();
-                } else if k.terminator == b'u' && k.codepoint == b'j' as u32 && k.modifiers == CTRL
+                } else if k.terminator == b'u'
+                    && (k.codepoint == b'j' as u32 || k.codepoint == b'J' as u32)
+                    && (k.modifiers == CTRL || k.modifiers == CTRL | SHIFT)
                 {
                     if k.event_type != EventType::Release {
                         self.insert_newline(writer)?;
@@ -587,6 +589,7 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
     thread::spawn(move || -> Result<()> {
         let stdin = std::io::stdin();
         let mut filter = InputFilter::new(log, input_stdout, input_vim_mode);
+        let input_mirror = child_pid.map(IdentityMirror::new);
         let mut buf = [0u8; 16384];
         loop {
             filter.sync_vim_mode()?;
@@ -609,7 +612,17 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
                 return Ok(());
             }
             filter.sync_vim_mode()?;
-            filter.process(&buf[..n], &mut *writer)?;
+            // A tmux client leads to another pane's proxy. Let that proxy own
+            // the toggle and preserve extended key events across this layer.
+            if input_mirror
+                .as_ref()
+                .is_some_and(IdentityMirror::foreground_is_tmux)
+            {
+                filter.process_pending(&mut *writer)?;
+                writer.write_all(&buf[..n]).context("forward tmux input")?;
+            } else {
+                filter.process(&buf[..n], &mut *writer)?;
+            }
         }
     });
 
