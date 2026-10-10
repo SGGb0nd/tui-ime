@@ -89,6 +89,10 @@ interception is off (including Vim Normal); `中文` means it is on; `OFF` means
 the daemon session is unavailable. The indicator describes proxy interception,
 not Rime's internal ASCII switch.
 
+`Ctrl+J` commits the highlighted candidate when composing Chinese, then passes
+the newline shortcut to the application. In Codex Insert mode this starts a
+new line; ordinary Enter keeps its existing behavior.
+
 Vim detection was exercised with Codex 0.161.0 in both default and
 `--no-alt-screen` layouts, including resizing and returning to Bash. It reads
 the displayed `Vim: Normal/Insert/Replace` label below the composer and checks

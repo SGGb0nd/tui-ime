@@ -31,7 +31,7 @@ const ESC_FLUSH_MS: u16 = 30;
 use crate::daemon;
 use crate::identity::IdentityMirror;
 use crate::ipc::IpcClient;
-use crate::keyevent::{to_legacy, InputEvent, Parser};
+use crate::keyevent::{to_legacy, EventType, InputEvent, Parser, CTRL};
 use crate::keymap::{byte_to_rime, key_to_rime, XK_ESCAPE};
 use crate::protocol::{ContextSnapshot, ProxyRequest, ProxyResponse};
 use crate::render::{Renderer, Strip};
@@ -387,10 +387,25 @@ impl InputFilter {
         self.parser.has_pending()
     }
 
+    fn insert_newline(&mut self, writer: &mut dyn Write) -> Result<()> {
+        if self.ime_on && self.composing {
+            // Select the highlighted Chinese candidate before giving the
+            // application's newline shortcut back to it. Rime Return would
+            // commit the raw preedit instead.
+            self.rime_key(b' ' as i32, 0, writer)?;
+        }
+        if !self.composing {
+            writer.write_all(b"\n").context("forward newline")?;
+        }
+        Ok(())
+    }
+
     fn handle_event(&mut self, ev: InputEvent, writer: &mut dyn Write) -> Result<()> {
         match ev {
             InputEvent::Byte(b) => {
-                if self.ime_on {
+                if b == b'\n' {
+                    self.insert_newline(writer)?;
+                } else if self.ime_on {
                     match byte_to_rime(b) {
                         Some((kc, mask)) => {
                             let consumed = self.rime_key(kc, mask, writer)?;
@@ -423,6 +438,11 @@ impl InputFilter {
                         self.log_line("toggle: ignored (daemon unavailable)");
                     }
                     self.update_mode_indicator();
+                } else if k.terminator == b'u' && k.codepoint == b'j' as u32 && k.modifiers == CTRL
+                {
+                    if k.event_type != EventType::Release {
+                        self.insert_newline(writer)?;
+                    }
                 } else if self.ime_on {
                     match key_to_rime(&k) {
                         Some((kc, mask)) => {
