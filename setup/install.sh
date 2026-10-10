@@ -37,7 +37,7 @@ for binary_name in tui-ime tui-ime-daemon; do
         exit 1
     }
 done
-for asset_name in bash.sh tmux-status.sh configure.mjs; do
+for asset_name in bash.sh tmux-status.sh codex-foreground.sh configure.mjs; do
     install -m644 "$setup_dir/$asset_name" "$install_dir/$asset_name"
 done
 node "$install_dir/configure.mjs"

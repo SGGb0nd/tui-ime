@@ -51,6 +51,8 @@ are not part of this repository.
 - Adds a managed hook to `~/.tmux.conf`. It prefixes the current `status-right`
   with the active pane's IME state and extends its width. Repeated application
   does not add more prefixes. Existing prompt and status formatting stay in use.
+  If a navigator plugin binds Ctrl+J, it forwards that key when Codex is the
+  inner foreground program and preserves the original binding elsewhere.
 - Sets `[tui] vim_mode_default = true` in `$CODEX_HOME/config.toml`, or
   `~/.codex/config.toml` when `CODEX_HOME` is unset. Other settings are preserved.
 - Creates a simplified Luna Pinyin Rime customization only if there is no
@@ -114,3 +116,7 @@ tmux -L tui-ime-backend kill-session -t daemon
 Reloading a tmux config does not undo runtime options: restore your previous
 `status-right`, width, and extended-key settings, or start a new tmux server.
 User dictionaries under `~/.local/share/tui-ime/rime` are retained.
+
+If the setup wrapped a Ctrl+J binding, its original action is saved in the tmux
+server option `@tui_ime_ctrl_j_fallback`. Reload the navigator plugin after
+removing the setup hook, or start a new tmux server, to restore its binding.
