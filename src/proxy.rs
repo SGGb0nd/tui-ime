@@ -129,13 +129,20 @@ struct InputFilter {
     /// 与主线程共享的 stdout（渲染组合 UI / 发 DSR 查询）
     stdout: Arc<Mutex<Stdout>>,
     renderer: Renderer,
+    child_screen: Arc<Mutex<VimModeReader>>,
+    rendered_generation: u64,
     dsr_pending: bool,
     composing: bool,
     tmux_pane: Option<String>,
     displayed_mode: Option<&'static str>,
 }
 impl InputFilter {
-    fn new(log: Option<File>, stdout: Arc<Mutex<Stdout>>, vim_mode: Arc<AtomicU8>) -> Self {
+    fn new(
+        log: Option<File>,
+        stdout: Arc<Mutex<Stdout>>,
+        vim_mode: Arc<AtomicU8>,
+        child_screen: Arc<Mutex<VimModeReader>>,
+    ) -> Self {
         let socket_path = daemon::default_socket_path();
         let mut client = IpcClient::connect(&socket_path).ok();
 
@@ -172,6 +179,8 @@ impl InputFilter {
             log,
             stdout,
             renderer: Renderer::new(),
+            child_screen,
+            rendered_generation: 0,
             dsr_pending: false,
             composing: false,
             tmux_pane: std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()),
@@ -289,6 +298,37 @@ impl InputFilter {
     }
 
     /// 按当前快照渲染/擦除组合 UI
+    fn draw_ui(&mut self, strip: &Strip) -> Result<()> {
+        // Both output paths lock stdout before the screen: sampling and drawing
+        // cannot race a child redraw or use its partially delivered frame.
+        let mut out = self.stdout.lock().expect("stdout mutex");
+        let reader = self.child_screen.lock().expect("child screen mutex");
+        let Some((screen, generation)) = reader.screen() else {
+            return Ok(());
+        };
+        self.renderer.sample_colors(screen);
+        let bytes = self.renderer.draw(strip, term_cols(), term_rows());
+        out.write_all(&bytes).and_then(|()| out.flush())?;
+        self.rendered_generation = generation;
+        Ok(())
+    }
+
+    fn refresh_ui(&mut self) -> Result<()> {
+        if !self.composing {
+            return Ok(());
+        }
+        let changed = self
+            .child_screen
+            .lock()
+            .expect("child screen mutex")
+            .screen()
+            .is_some_and(|(_, generation)| generation != self.rendered_generation);
+        if changed {
+            self.draw_ui(&self.snapshot_strip())?;
+        }
+        Ok(())
+    }
+
     fn render_ui(&mut self, strip: &Strip) -> Result<()> {
         let was_composing = self.composing;
         self.composing = strip.is_active();
@@ -297,8 +337,7 @@ impl InputFilter {
                 // 空→非空跃迁：查询光标行列以精确截断/借行（计划 D3）
                 self.query_cursor_col()?;
             }
-            let out = self.renderer.draw(strip, term_cols(), term_rows());
-            self.write_stdout(&out)?;
+            self.draw_ui(strip)?;
         } else if was_composing {
             self.clear_ui()?;
         }
@@ -467,8 +506,7 @@ impl InputFilter {
                     self.renderer.set_cursor_pos(row, col);
                     if self.composing {
                         let strip = self.snapshot_strip();
-                        let out = self.renderer.draw(&strip, term_cols(), term_rows());
-                        self.write_stdout(&out)?;
+                        self.draw_ui(&strip)?;
                     }
                 } else {
                     // 非我们发起的查询响应：转发给 shell
@@ -586,13 +624,17 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
     let input_stdout = Arc::clone(&stdout);
     let vim_mode = Arc::new(AtomicU8::new(vim_mode::UNKNOWN));
     let input_vim_mode = Arc::clone(&vim_mode);
+    let size = term_size();
+    let child_screen = Arc::new(Mutex::new(VimModeReader::new(size.rows, size.cols)));
+    let input_child_screen = Arc::clone(&child_screen);
     thread::spawn(move || -> Result<()> {
         let stdin = std::io::stdin();
-        let mut filter = InputFilter::new(log, input_stdout, input_vim_mode);
+        let mut filter = InputFilter::new(log, input_stdout, input_vim_mode, input_child_screen);
         let input_mirror = child_pid.map(IdentityMirror::new);
         let mut buf = [0u8; 16384];
         loop {
             filter.sync_vim_mode()?;
+            filter.refresh_ui()?;
             let timeout = if filter.parser_has_pending() {
                 PollTimeout::from(ESC_FLUSH_MS)
             } else {
@@ -633,8 +675,6 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
     // tmux 只能观察到 proxy 进程：随子进程输出限流镜像内部前台进程身份
     // （cwd 到自身、窗口名经 tmux rename-window），见 src/identity.rs
     let mut mirror = child_pid.map(IdentityMirror::new);
-    let size = term_size();
-    let mut vim_reader = VimModeReader::new(size.rows, size.cols);
     let mut buf = [0u8; 16384];
     loop {
         match reader.read(&mut buf) {
@@ -647,13 +687,14 @@ pub fn run(command: &[String], log: Option<File>) -> Result<i32> {
                 let codex_foreground = mirror
                     .as_ref()
                     .is_some_and(IdentityMirror::foreground_is_codex);
+                let mut out = stdout.lock().expect("stdout mutex");
+                let mut vim_reader = child_screen.lock().expect("child screen mutex");
                 if let Some(mode) =
                     vim_reader.process(&buf[..n], size.rows, size.cols, codex_foreground)
                 {
                     vim_mode.store(mode, Ordering::Release);
                 }
                 let repush = snoop.scan(&buf[..n]);
-                let mut out = stdout.lock().expect("stdout mutex");
                 out.write_all(&buf[..n])?;
                 if !repush.is_empty() {
                     out.write_all(&repush)?;

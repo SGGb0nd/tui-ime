@@ -61,6 +61,9 @@ pub struct Renderer {
     /// 最近一次 draw 的终端行数（借行/还行的滚动区域上限）
     term_rows: u16,
     place: Place,
+    foreground: vt100::Color,
+    background: vt100::Color,
+    inverse: bool,
 }
 
 /// 样式 token：文本片段 + 是否高亮
@@ -75,7 +78,7 @@ enum Style {
     Preedit,
     /// 普通候选：dim
     Plain,
-    /// 高亮候选：dim + 反显
+    /// 高亮候选：粗体 + 下划线，保持应用背景
     Highlight,
 }
 
@@ -87,12 +90,55 @@ impl Renderer {
             cursor_row: None,
             term_rows: 24,
             place: Place::Inline,
+            foreground: vt100::Color::Default,
+            background: vt100::Color::Default,
+            inverse: false,
         }
     }
 
     pub fn set_cursor_pos(&mut self, row: u16, col: u16) {
         self.cursor_row = Some(row);
         self.cursor_col = Some(col);
+    }
+
+    /// Sample the child application's painted cell, rather than its last SGR.
+    pub(crate) fn sample_colors(&mut self, screen: &vt100::Screen) {
+        let (rows, cols) = screen.size();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let row = self
+            .cursor_row
+            .map(|r| r.saturating_sub(1))
+            .unwrap_or(cursor_row);
+        let col = self
+            .cursor_col
+            .map(|c| c.saturating_sub(1))
+            .unwrap_or(cursor_col);
+        let below = self.cursor_col.is_some()
+            && self.avail_width(cols) < MIN_INLINE_WIDTH
+            && row.saturating_add(1) < rows;
+        let (row, col) = if below { (row + 1, 0) } else { (row, col) };
+        if let Some(cell) = screen.cell(row, col) {
+            self.foreground = cell.fgcolor();
+            self.background = cell.bgcolor();
+            self.inverse = cell.inverse();
+        }
+    }
+
+    fn emit_colors(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[0m");
+        for (color, channel, default) in [(self.foreground, 38, 39), (self.background, 48, 49)] {
+            let sequence = match color {
+                vt100::Color::Default => format!("\x1b[{default}m"),
+                vt100::Color::Idx(index) => format!("\x1b[{channel};5;{index}m"),
+                vt100::Color::Rgb(r, g, b) => format!("\x1b[{channel};2;{r};{g};{b}m"),
+            };
+            out.extend_from_slice(sequence.as_bytes());
+        }
+        // Preserve inverse cells even when one color is the terminal default:
+        // default foreground and default background are distinct colors.
+        if self.inverse {
+            out.extend_from_slice(b"\x1b[7m");
+        }
     }
 
     /// 组合结束/关闭时复位列信息（下次组合重新查询）
@@ -154,6 +200,7 @@ impl Renderer {
         let mut out = Vec::new();
         out.extend_from_slice(b"\x1b[?25l"); // 隐藏光标
         out.extend_from_slice(b"\x1b7"); // 保存光标
+        self.emit_colors(&mut out);
         emit_tokens(&mut out, &tokens);
         // 尾部擦除：本次比上次短时，用空格盖住残余
         if used < self.prev_width {
@@ -175,6 +222,7 @@ impl Renderer {
         let mut out = Vec::new();
         out.extend_from_slice(b"\x1b[?25l\x1b7");
         out.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+        self.emit_colors(&mut out);
         emit_tokens(&mut out, &tokens);
         if used < self.prev_width {
             out.extend(std::iter::repeat_n(b' ', self.prev_width - used));
@@ -192,6 +240,7 @@ impl Renderer {
         let mut out = Vec::new();
         out.extend_from_slice(b"\x1b[?25l");
         out.extend_from_slice(b"\x1b7");
+        self.emit_colors(&mut out);
         out.extend(std::iter::repeat_n(b' ', self.prev_width));
         out.extend_from_slice(b"\x1b8");
         out.extend_from_slice(b"\x1b[?25h");
@@ -208,6 +257,7 @@ impl Renderer {
         out.extend_from_slice(b"\x1b[?25l\x1b7");
         out.extend_from_slice(format!("\x1b[{row};{rows}r").as_bytes()); // 滚动区域
         out.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+        self.emit_colors(&mut out);
         out.extend_from_slice(b"\x1b[L"); // 插入空白行
         out.extend_from_slice(b"\x1b[r"); // 还原滚动区域（光标归 \e8 恢复）
         out.extend_from_slice(b"\x1b8\x1b[?25h");
@@ -249,9 +299,9 @@ fn emit_tokens(out: &mut Vec<u8>, tokens: &[Token]) {
             }
             Style::Plain => out.extend_from_slice(t.text.as_bytes()),
             Style::Highlight => {
-                out.extend_from_slice(b"\x1b[7m");
+                out.extend_from_slice(b"\x1b[22;1;4m");
                 out.extend_from_slice(t.text.as_bytes());
-                out.extend_from_slice(b"\x1b[27m");
+                out.extend_from_slice(b"\x1b[22;24;2m");
             }
         }
     }

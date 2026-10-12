@@ -95,6 +95,13 @@ starts a new line. Unshifted `Ctrl+j` keeps your existing tmux pane-navigation
 binding. The proxy preserves modifiers while a tmux client is foreground, so
 the outer shell wrapper does not collapse these two shortcuts into one.
 
+The candidate overlay samples the child TUI's painted cell beneath its anchor,
+including RGB and indexed theme colors. It uses that background for the bar
+and marks the selected candidate with bold and underline. Completed TUI
+redraws refresh an active overlay, so changing the application's theme during
+composition updates the bar without another keystroke. This follows the
+application's drawn background, rather than the terminal's default color.
+
 An old proxy around the SSH shell remains in memory after upgrading. Reconnect
 SSH and reattach the existing tmux session to reload that outer wrapper; tmux
 and its programs keep running. New panes load the updated inner wrapper.

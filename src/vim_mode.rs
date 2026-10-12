@@ -9,6 +9,7 @@ pub(crate) struct VimModeReader {
     parser: vt100::Parser,
     synchronized: bool,
     tail: Vec<u8>,
+    generation: u64,
 }
 
 impl VimModeReader {
@@ -17,6 +18,7 @@ impl VimModeReader {
             parser: vt100::Parser::new(rows, cols, 0),
             synchronized: false,
             tail: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -43,11 +45,12 @@ impl VimModeReader {
             }
         }
         self.tail = output[output.len().saturating_sub(7)..].to_vec();
-        if !codex_foreground {
-            return Some(UNKNOWN);
-        }
         if self.synchronized {
             return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if !codex_foreground {
+            return Some(UNKNOWN);
         }
 
         let screen = self.parser.screen();
@@ -77,5 +80,9 @@ impl VimModeReader {
                 })
                 .unwrap_or(UNKNOWN),
         )
+    }
+
+    pub(crate) fn screen(&self) -> Option<(&vt100::Screen, u64)> {
+        (!self.synchronized).then_some((self.parser.screen(), self.generation))
     }
 }
