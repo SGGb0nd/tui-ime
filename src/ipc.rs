@@ -1,6 +1,7 @@
 //! IPC 传输层：Unix socket + JSON 消息帧。
 
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -81,6 +82,7 @@ impl IpcClient {
 pub struct IpcServer {
     listener: UnixListener,
     path: PathBuf,
+    socket_identity: (u64, u64),
 }
 
 impl IpcServer {
@@ -88,19 +90,42 @@ impl IpcServer {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if path.exists() {
-            if UnixStream::connect(path).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!("daemon socket already in use: {}", path.display()),
-                ));
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("daemon socket path is not a socket: {}", path.display()),
+                    ));
+                }
+                match UnixStream::connect(path) {
+                    Ok(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AddrInUse,
+                            format!("daemon socket already in use: {}", path.display()),
+                        ));
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                    Err(error) => return Err(error),
+                }
+                let current = std::fs::symlink_metadata(path)?;
+                if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        format!("daemon socket changed while binding: {}", path.display()),
+                    ));
+                }
+                std::fs::remove_file(path)?;
             }
-            std::fs::remove_file(path)?;
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let listener = UnixListener::bind(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
         Ok(Self {
             listener,
             path: path.to_path_buf(),
+            socket_identity: (metadata.dev(), metadata.ino()),
         })
     }
 
@@ -115,7 +140,13 @@ impl IpcServer {
 
 impl Drop for IpcServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
+            if metadata.file_type().is_socket()
+                && (metadata.dev(), metadata.ino()) == self.socket_identity
+            {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
